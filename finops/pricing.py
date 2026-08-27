@@ -60,21 +60,83 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+# Per-GPU spot interruption risk (illustrative 2026) — H100 spot is usually
+# reclaimed less often than small inference GPUs like A10G/L4.
+GPU_SPOT_INTERRUPT_RATE = {
+    "H100": 0.05, "H200": 0.05, "B200": 0.08,
+    "A100": 0.12, "A10G": 0.25, "L4": 0.20, "MI300X": 0.15,
+}
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+# Pathologically unreliable spot — rework cost eats the discount entirely.
+HIGH_INTERRUPT_RATE = 0.60
+
+
+def spot_interrupt_rate(gpu_type: str | None) -> float:
+    """Interruption rate for a GPU type (used to price spot honestly)."""
+    return GPU_SPOT_INTERRUPT_RATE.get(gpu_type, 0.15)
+
+
+def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45,
+                   gpu_type: str | None = None, job_days: float | None = None) -> str:
+    """Pick a purchasing tier from duty cycle + interruptibility + GPU/term specifics.
+
+    Extended policy (beyond the documented simple one):
+      1. Spot is priced with the GPU's real interruption rate instead of a flat 5%
+         — `spot_interrupt_rate()`/`spot_checkpoint_cost()` reflect rework cost
+         per GPU type (A10G/L4 spot is reclaimed far more often than H100/A100).
+      2. Reserved term is matched to the job's real length via
+         `reserved_hourly_rate()` — 3yr for steady services, 1yr for bounded jobs.
+    Calling with only (hours_per_day, interruptible) reproduces the original policy.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
     if interruptible and hours_per_day < 24:
-        return "spot"
+        rate = spot_interrupt_rate(gpu_type)
+        if rate <= HIGH_INTERRUPT_RATE:
+            return "spot"
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def reserved_hourly_rate(catalog_row: dict, job_days: float | None = None,
+                         steady: bool = False) -> float:
+    """Pick the reserved hourly rate: 1yr for short-lived jobs, 3yr for long-lived ones.
+
+    A 3yr commitment is cheaper per hour but over-pays when the job finishes in
+    under a year. `steady=True` (always-on inference service) keeps 3yr; bounded
+    jobs under a year are priced at the 1yr rate instead of being over-committed.
+    """
+    one_yr = float(catalog_row.get("reserved_1yr_hr", 0.0) or 0.0)
+    three_yr = float(catalog_row.get("reserved_3yr_hr", 0.0) or 0.0)
+    if steady:
+        return three_yr
+    if job_days is not None and job_days < 365:
+        return one_yr
+    return three_yr
+
+
+def cache_break_even_reads(write_cost_per_m: float, price_in_per_m: float,
+                           read_discount: float = 0.10) -> float:
+    """Number of cache reads needed to pay back the one-time write cost.
+
+    Each read of a cached 1M-token prefix saves `price_in * (1 - read_discount)`.
+    """
+    savings_per_read = price_in_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / savings_per_read
+
+
+def cache_is_worth_it(avg_cache_reads: float, write_cost_per_m: float,
+                      price_in_per_m: float, read_discount: float = 0.10) -> bool:
+    """True when repeated reads of a cached prefix save more than the write cost.
+
+    Caching is not free: writing a prefix costs `write_cost_per_m`. It only pays
+    off when the prefix is reused enough times to amortize that write.
+    """
+    return avg_cache_reads >= cache_break_even_reads(write_cost_per_m, price_in_per_m,
+                                                     read_discount)
 
 
 def spot_checkpoint_cost(
